@@ -69,13 +69,27 @@
  *
  * BUILT-IN PROVIDERS (registered by th_create):
  *
- *   bmp  Real decoder for uncompressed 24/32-bit BMP.
- *   ppm  Real decoder for binary PPM (P6, maxval 255).
+ *   bmp   Real decoder for uncompressed 24/32-bit BMP.
+ *   ppm   Real decoder for binary PPM (P6, maxval 255).
+ *   png   Real decoder: color types 0/2/3/4/6, bit
+ *         depths 1/2/4/8/16, all scanline filters,
+ *         Adam7 interlacing. Alpha is dropped (the
+ *         colour is kept as stored).
+ *   jpg / jpeg
+ *         Real decoder for sequential JPEG (SOF0
+ *         baseline and SOF1): Huffman entropy coding,
+ *         restart intervals, grayscale and 3-component
+ *         (YCbCr or RGB) with any 1..=4 sampling
+ *         factors, upsampled by nearest neighbour.
+ *         Progressive JPEG (SOF2) and 4-component
+ *         (CMYK) files return "unsupported" — stated
+ *         here, in the error message, and in the
+ *         README rather than decoded wrong.
  *
- * Both decode, downscale with nearest-neighbour sampling
- * (NEVER upscale: a smaller source keeps its size), and
- * write a 24-bit BMP thumbnail. Every other format —
- * PNG, JPEG, GIF included — has NO built-in decoder:
+ * All four decode, downscale with nearest-neighbour
+ * sampling (NEVER upscale: a smaller source keeps its
+ * size), and write a 24-bit BMP thumbnail. Every other
+ * format — GIF included — has NO built-in decoder:
  * requests for it end in state "unsupported" unless a
  * provider is registered. ThumbKit never fabricates a
  * placeholder thumbnail.
