@@ -1,7 +1,7 @@
 # ThumbKit — agent notes
 
 - The no-placeholder rule is load-bearing: a format without a real decoder returns `unsupported`. Never add a provider that renders a placeholder, an icon, or a header-only "preview" and reports it as a thumbnail.
-- Built-in decoder scope is narrow on purpose: BMP uncompressed 24/32-bit and PPM P6/maxval 255 only. Other variants return `TH_ERR_NOT_SUPPORTED` with the reason in the message. Widening scope means a real decoder for the new variant, not a looser check.
+- Built-in decoder scope is deliberate: BMP uncompressed 24/32-bit, PPM P6/maxval 255, PNG (color types 0/2/3/4/6, bit depths 1/2/4/8/16, all filters, Adam7), JPEG sequential SOF0/SOF1 only. Everything else — progressive JPEG, CMYK, compressed BMP — returns `TH_ERR_NOT_SUPPORTED` with the reason in the message. Widening scope means a real decoder for the new variant, not a looser check. The PNG/JPEG decoders and the DEFLATE inflater are from scratch in src/png.rs, src/jpeg.rs, src/inflate.rs; zero dependencies is load-bearing (no flate2/image crates, ever).
 - The decoder memory cap (100 MP / 256 MiB, checked before allocation or any data-length validation that could mask it) is a safety path: the oversize tests assert the cap error wins over truncation errors.
 - Cache keys must cover canonical path + size + mtime + preset + provider name. Dropping any component reintroduces stale-thumbnails-served-as-current. Provider names include the registration sequence number for exactly this reason.
 - The entry just generated is never evicted by its own bound-enforcement pass (documented in the header). "Fixing" that makes an oversized single thumbnail generate-then-delete on every request.
