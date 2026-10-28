@@ -342,7 +342,7 @@ mod tests {
         let cache = dir.join("cache");
         let cfg = cs(&format!(
             "{{\"cache_dir\":\"{}\"}}",
-            cache.to_string_lossy()
+            crate::json_escape(&cache.to_string_lossy())
         ));
         let mut handle: *mut Pipeline = std::ptr::null_mut();
         assert_eq!(th_create(cfg.as_ptr(), &mut handle), TH_OK as c_int);
