@@ -1712,9 +1712,20 @@ mod tests {
         out: *const c_char,
         w: c_int,
         h: c_int,
-        _ud: *mut c_void,
+        ud: *mut c_void,
     ) -> c_int {
-        COUNT.fetch_add(1, Ordering::SeqCst);
+        // Per-test counters travel in user_data so parallel
+        // tests never share a count (a shared static made the
+        // invalidation test flaky on loaded CI runners: the
+        // other counting test could reset/increment it
+        // mid-assert). Null user_data keeps the old shared
+        // counter for wrappers that do not care.
+        if ud.is_null() {
+            COUNT.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let counter = unsafe { &*(ud as *const AtomicU64) };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
         let src = unsafe { std::ffi::CStr::from_ptr(src) }.to_str().unwrap();
         let out = unsafe { std::ffi::CStr::from_ptr(out) }.to_str().unwrap();
         match generate_thumbnail_file(Path::new(src), Path::new(out), w as u32, h as u32) {
@@ -1728,10 +1739,14 @@ mod tests {
         let dir = temp_dir("hit");
         let src = dir.join("a.bmp");
         write_bmp_fixture(&src, 16, 8, |x, y| ((x * 10) as u8, (y * 20) as u8, 3));
-        COUNT.store(0, Ordering::SeqCst);
+        let count: &AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
         let pipe = make_pipeline(&dir, "");
-        pipe.register_provider("bmp", counting_bmp, std::ptr::null_mut())
-            .unwrap();
+        pipe.register_provider(
+            "bmp",
+            counting_bmp,
+            count as *const AtomicU64 as *mut c_void,
+        )
+        .unwrap();
         let src_s = src.to_string_lossy().to_string();
 
         let id = pipe
@@ -1744,7 +1759,7 @@ mod tests {
         assert_eq!((st.width, st.height), (8, 4));
         let thumb_path = st.thumb_path.clone().unwrap();
         assert!(Path::new(&thumb_path).exists());
-        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Second identical request: cache hit, provider NOT called again.
         let id2 = pipe
@@ -1755,7 +1770,7 @@ mod tests {
         assert_eq!(st2.state, ReqState::Done);
         assert_eq!(st2.thumb_path, Some(thumb_path));
         assert_eq!(
-            COUNT.load(Ordering::SeqCst),
+            count.load(Ordering::SeqCst),
             1,
             "provider ran on a cache hit"
         );
@@ -1785,15 +1800,19 @@ mod tests {
         let dir = temp_dir("invalidate");
         let src = dir.join("a.bmp");
         write_bmp_fixture(&src, 8, 8, |_, _| (10, 10, 10));
-        COUNT.store(0, Ordering::SeqCst);
+        let count: &AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
         let pipe = make_pipeline(&dir, "");
-        pipe.register_provider("bmp", counting_bmp, std::ptr::null_mut())
-            .unwrap();
+        pipe.register_provider(
+            "bmp",
+            counting_bmp,
+            count as *const AtomicU64 as *mut c_void,
+        )
+        .unwrap();
         let src_s = src.to_string_lossy().to_string();
         let id = pipe.request(&src_s, None).unwrap();
         pipe.wait(id, 10_000).unwrap();
         let first_thumb = pipe.poll(id).unwrap().thumb_path.unwrap();
-        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Change the source (different size AND content):
         // the cache key changes, so this is a miss, and the
@@ -1803,7 +1822,7 @@ mod tests {
         pipe.wait(id2, 10_000).unwrap();
         let second_thumb = pipe.poll(id2).unwrap().thumb_path.unwrap();
         assert_ne!(first_thumb, second_thumb);
-        assert_eq!(COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
 
         let report = json::parse(&pipe.sweep()).unwrap();
         assert_eq!(report.get("removed_orphans").unwrap().as_i64(), Some(1));
