@@ -110,7 +110,7 @@ fn report(result: ThResult<()>) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn th_version() -> *const c_char {
-    static VERSION_C: &[u8] = b"0.1.0\0";
+    static VERSION_C: &[u8] = b"0.2.0\0";
     VERSION_C.as_ptr() as *const c_char
 }
 

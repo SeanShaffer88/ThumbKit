@@ -7,11 +7,14 @@
 //!   `(source_path, out_path, max_w, max_h, user_data)`; it
 //!   writes a thumbnail file to `out_path` and returns 0
 //!   on success. Built-in providers cover BMP (24/32-bit
-//!   uncompressed) and PPM (P6) for real — decode,
-//!   nearest-neighbour downscale (never upscale), BMP out.
-//!   Formats without a decoder (PNG/JPEG/GIF/…) return
-//!   `unsupported` until a provider is registered for them.
-//!   There are no placeholder thumbnails.
+//!   uncompressed), PPM (P6), PNG (all color types and
+//!   bit depths, Adam7 included) and JPEG (baseline /
+//!   extended sequential; progressive and CMYK return
+//!   `unsupported`) for real — decode, nearest-neighbour
+//!   downscale (never upscale), BMP out. Formats without
+//!   a decoder (GIF/…) return `unsupported` until a
+//!   provider is registered for them. There are no
+//!   placeholder thumbnails.
 //! - **Bounded cache.** Entries live in `cache_dir` as
 //!   `<sha256>.thumb` plus a `<sha256>.json` sidecar. The
 //!   key covers the canonical source path, source size,
@@ -31,13 +34,16 @@
 //! allocating it.
 
 pub mod ffi;
+pub mod inflate;
+pub mod jpeg;
 pub mod json;
 pub mod platform;
+pub mod png;
 pub mod sha256;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_MINOR: u32 = 2;
 pub const VERSION_PATCH: u32 = 0;
 
 // Error codes (mirror include/thumbkit.h).
@@ -238,7 +244,8 @@ pub fn parse_preset(text: Option<&str>, cfg: &Config) -> ThResult<Preset> {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in decoders: BMP and PPM -> RGB -> downscaled BMP
+// Built-in decoders: BMP, PPM, PNG (src/png.rs) and JPEG
+// (src/jpeg.rs) -> RGB -> downscaled BMP
 // ---------------------------------------------------------------------------
 
 /// A decoded image: top-down rows, 3 bytes per pixel (RGB).
@@ -490,9 +497,10 @@ pub fn encode_bmp(img: &DecodedImage) -> Vec<u8> {
 
 /// The built-in generation path shared by the built-in
 /// providers and exposed for the Rust API / tests: decode
-/// the source (by extension: `bmp` or `ppm`), downscale,
-/// write a BMP thumbnail to `out_path`. Returns
-/// (source_width, source_height, thumb_width, thumb_height).
+/// the source (by extension: `bmp`, `ppm`, `png`, `jpg`
+/// or `jpeg`), downscale, write a BMP thumbnail to
+/// `out_path`. Returns (source_width, source_height,
+/// thumb_width, thumb_height).
 pub fn generate_thumbnail_file(
     source: &std::path::Path,
     out_path: &std::path::Path,
@@ -508,6 +516,8 @@ pub fn generate_thumbnail_file(
     let img = match ext.as_str() {
         "bmp" => decode_bmp(&bytes)?,
         "ppm" => decode_ppm(&bytes)?,
+        "png" => png::decode_png(&bytes)?,
+        "jpg" | "jpeg" => jpeg::decode_jpeg(&bytes)?,
         _ => {
             return Err((
                 ERR_NOT_SUPPORTED,
@@ -536,6 +546,8 @@ fn source_dimensions(path: &std::path::Path) -> (u32, u32) {
     match ext.as_str() {
         "bmp" => bmp_dimensions(&bytes).unwrap_or((0, 0)),
         "ppm" => ppm_dimensions(&bytes).unwrap_or((0, 0)),
+        "png" => png::png_dimensions(&bytes).unwrap_or((0, 0)),
+        "jpg" | "jpeg" => jpeg::jpeg_dimensions(&bytes).unwrap_or((0, 0)),
         _ => (0, 0),
     }
 }
@@ -852,8 +864,8 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Create a pipeline: create the cache directory if
-    /// needed, register the built-in BMP and PPM providers,
-    /// and spawn the worker pool.
+    /// needed, register the built-in BMP, PPM, PNG and
+    /// JPEG providers, and spawn the worker pool.
     pub fn create(config: Config) -> ThResult<Arc<Pipeline>> {
         std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
             (
@@ -873,6 +885,16 @@ impl Pipeline {
                     Provider {
                         name: "builtin-ppm".to_string(),
                         extensions: vec!["ppm".to_string()],
+                        kind: ProviderKind::Builtin,
+                    },
+                    Provider {
+                        name: "builtin-png".to_string(),
+                        extensions: vec!["png".to_string()],
+                        kind: ProviderKind::Builtin,
+                    },
+                    Provider {
+                        name: "builtin-jpeg".to_string(),
+                        extensions: vec!["jpg".to_string(), "jpeg".to_string()],
                         kind: ProviderKind::Builtin,
                     },
                 ],
@@ -1327,7 +1349,7 @@ fn process_request(shared: &Shared, id: u64) {
                     ERR_NOT_SUPPORTED,
                     format!(
                         "no provider registered for extension \"{ext}\" \
-                         (built-ins cover bmp and ppm; register a provider for other formats)"
+                         (built-ins cover bmp, ppm, png and jpeg; register a provider for other formats)"
                     ),
                 ),
             );
@@ -1788,10 +1810,68 @@ mod tests {
         let src = dir.join("a.ppm");
         write_ppm_fixture(&src, 4, 4);
         let pipe = make_pipeline(&dir, "");
-        assert_eq!(pipe.provider_names(), vec!["builtin-bmp", "builtin-ppm"]);
+        assert_eq!(
+            pipe.provider_names(),
+            vec!["builtin-bmp", "builtin-ppm", "builtin-png", "builtin-jpeg"]
+        );
         let id = pipe.request(&src.to_string_lossy(), None).unwrap();
         pipe.wait(id, 10_000).unwrap();
         assert_eq!(pipe.poll(id).unwrap().state, ReqState::Done);
+        pipe.shutdown();
+    }
+
+    #[test]
+    fn builtin_png_and_jpeg_end_to_end() {
+        let dir = temp_dir("pngjpeg");
+        let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let png_src = dir.join("pic.png");
+        std::fs::copy(format!("{fixtures}/png_rgb8.png"), &png_src).unwrap();
+        let jpg_src = dir.join("pic.jpg");
+        std::fs::copy(format!("{fixtures}/jpg_420.jpg"), &jpg_src).unwrap();
+        let jpeg_src = dir.join("pic2.jpeg");
+        std::fs::copy(format!("{fixtures}/jpg_444.jpg"), &jpeg_src).unwrap();
+        let pipe = make_pipeline(&dir, "");
+        for (src, sw, sh) in [
+            (&png_src, 4u32, 4u32),
+            (&jpg_src, 16, 16),
+            (&jpeg_src, 8, 8),
+        ] {
+            let id = pipe
+                .request(&src.to_string_lossy(), Some(r#"{"max_w":2,"max_h":2}"#))
+                .unwrap();
+            pipe.wait(id, 10_000).unwrap();
+            let st = pipe.poll(id).unwrap();
+            assert_eq!(st.state, ReqState::Done, "{src:?}: {:?}", st.error);
+            assert_eq!((st.source_width, st.source_height), (sw, sh));
+            assert_eq!((st.width, st.height), (2, 2));
+            // Second request is a cache hit with the
+            // same thumbnail path.
+            let id2 = pipe
+                .request(&src.to_string_lossy(), Some(r#"{"max_w":2,"max_h":2}"#))
+                .unwrap();
+            pipe.wait(id2, 10_000).unwrap();
+            let st2 = pipe.poll(id2).unwrap();
+            assert_eq!(st2.state, ReqState::Done);
+            assert_eq!(st2.thumb_path, st.thumb_path);
+        }
+        pipe.shutdown();
+    }
+
+    #[test]
+    fn corrupt_png_fails_cleanly_not_unsupported() {
+        // A .png with a real built-in provider reaches
+        // the decoder: garbage in is a decode FAILURE
+        // (state failed), not "unsupported" — the format
+        // is supported, this file is broken.
+        let dir = temp_dir("corruptpng");
+        let src = dir.join("broken.png");
+        std::fs::write(&src, b"\x89PNG\r\n\x1a\n not really a png").unwrap();
+        let pipe = make_pipeline(&dir, "");
+        let id = pipe.request(&src.to_string_lossy(), None).unwrap();
+        pipe.wait(id, 10_000).unwrap();
+        let st = pipe.poll(id).unwrap();
+        assert_eq!(st.state, ReqState::Failed);
+        assert!(st.error.unwrap().contains("invalid PNG"));
         pipe.shutdown();
     }
 
@@ -1872,8 +1952,8 @@ mod tests {
     #[test]
     fn unsupported_format_is_honest() {
         let dir = temp_dir("unsupported");
-        let src = dir.join("photo.png");
-        std::fs::write(&src, b"\x89PNG\r\n\x1a\n not really a png").unwrap();
+        let src = dir.join("photo.gif");
+        std::fs::write(&src, b"GIF89a not really a gif").unwrap();
         let pipe = make_pipeline(&dir, "");
         let id = pipe.request(&src.to_string_lossy(), None).unwrap();
         pipe.wait(id, 10_000).unwrap();
